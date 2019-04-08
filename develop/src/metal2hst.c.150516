@@ -1,0 +1,1719 @@
+/*
+	program:	metal2hst.c
+	author:		Peng Yi at JHU
+	date:		Dec. 28, 2013
+	purpose:	analyze LAMMPS dump file for metal simulations
+	note:		require setup file
+	update:
+			Dec. 28, 2013	Created based on lammps2hst.c
+			Mar. 04, 2014	Enable calling LAMMPS as functions
+*/
+#define __MAIN_PROGRAM
+#include "header.h"
+
+#define M2HVERSION	"14May2015"
+#define M2HDEBUG	1
+#define MAXNINPUTFILE	32
+
+#undef CODE
+
+//#include "correlation.h"		// autocorrelation calculation module, can consume a lot of memory
+
+//==============================//
+//	Global variables	//
+//==============================//
+long		timestep;
+
+float		R02;
+float		Rg2[MAXNMOLS];		// Radius of gyration square
+float		rgx2[MAXNMOLS], rgy2[MAXNMOLS], rgz2[MAXNMOLS];
+float		avergx2, avergy2, avergz2;
+
+vector		dr_sys;			// vector of system drift
+float		d2initave,		// average displacement w.r.t. to the beginning
+		d2lastave,		// average displacement w.r.t. to previous dump
+                d2sys, d2syslast;
+float		asphericity;		// asphericity of the box
+
+//==============================================//
+//	Function Declarations and Definitions	//
+//==============================================//
+void 		output_xyzfile(FILE *, FILE *);
+void		output_carfile(FILE *);
+void		output_pdbfile(FILE *);
+int 		displayatom(int n);
+void		shift_coord();
+void 		monitor_coord();
+
+//======================//
+//	Main Program	//
+//======================//
+int main(int argc, char *argv[])
+{
+   printf("Program start\n");
+   fflush(stdout);
+
+   time_t	t	=	time(NULL);
+   time_t	prog_start, prog_end, start, end;
+   molstruct	*moli;
+   long		i, j, k, system, m, n, id, maxid, max, size;
+   long		siteid, molid, type;
+   int		nx, ny, nz, nx1, ny1, nz1;
+   double	x, y, z, 			// coordinates
+		vx, vy, vz, 			// velocity
+		fx, fy, fz,			// force
+		xhi, xlo, yhi, 			// box lower boundary
+		ylo, zhi, zlo,			// box upper boundary
+		xy=0.0, xz=0.0, yz=0.0;		// triclinic parameter
+   long		LENGTH, accum;			// chain length variables
+
+   // dummy variables
+   
+   int		itmp1, itmp2, itmp3;
+   double	tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
+   int		*itmptr;
+   double	*tmptr;
+   vector	vtmp;
+   double	*data1D;
+   double	**data2D;
+   int		*ldata1D;
+   int		*lmp_atomid;
+
+   // file variables
+   
+   char		infile[MAXNINPUTFILE][80], filein[80], filename[80], procid[16];
+   char		s[80], ff[80], par[80], dummy[255];
+   char		atomname;			// for visualization file output
+
+   FILE		*fin, *fhst, *fpre;		// input and analysis output
+   FILE		*fxyz;
+   FILE		*fcolor;
+   FILE		*fcar, *fconf, *fpdb, *fdat;	// configuration/visualization output
+   FILE		*fZfile;			// Z-code input configuration file
+
+   int		preflag		= 0;		// flags for input command line
+   int		polydisperse	= 0;
+   int		confflag	= 0;
+   int		carflag		= 0;
+   int		pdbflag		= 0;
+   int		xyzflag		= 0;
+   int		Zflag		= 0;
+   int		lammpsflag	= 0;		// whether or not to invode LAMMPS
+   int		nfiles=1;			// number of input files 
+   int		ifile;				// index of input file
+   int		nframe, dnframe = 1;		// analyze only every dnframe
+   int		previous_timestep = -1;
+   int		starttime = -1;
+   int		endtime = -1;
+
+   static int	firstconf = 1;			// first configuration read
+
+   vector		con;			// center of nucleus
+   static vector	rO;			// original position of nucleus
+
+   // configuration init flag
+   static int	confinit = 1;
+
+   // cell list flag
+   static int	clistinit=1;
+
+   printf("declare hyperdistance variable arrays\n");
+   fflush(stdout);
+   // hyper-distance
+   static float r_MD[MAXNMOLS*MAXNMOLSITES];	// coordinates in a dynamic trajectory
+   static float r_MIN[MAXNMOLS*MAXNMOLSITES];	// coordinates in a minimized trajectory
+   static float	r_trj[MAXNMOLS*MAXNMOLSITES];	// coordinates in a trajectory
+   static float	r_ref[MAXNMOLS*MAXNMOLSITES];	// coordinates in a reference configuration
+   static float r_trjold[MAXNMOLS*MAXNMOLSITES];	// coordinates in the previous step
+   static float r_refold[MAXNMOLS*MAXNMOLSITES];	// coordinates in the previous step
+
+   printf("declare rbead\n");
+   fflush(stdout);
+   // a group of beads
+
+   vector	rbead[MAXNMOLS*MAXNMOLSITES];
+
+   // variables to characterize nucleus, chains, etc at ONE timestep
+
+   long		nsites;
+   int 		nuclid;
+   int		nmaxid;					// nuclid of the largest nucleus
+   beadstruct	nucleus[MAXNMOLS*MAXNMOLSITES];		// group beads in the same nucleus
+   vector	com[MAXNMOLS];				// average center of mass
+   long		ncom[MAXNMOLS];
+   int		nchainmax;				// # of chains in the largest nucleus
+
+   // density profile
+
+   long		direct;
+   double	density[100];
+   vector	rsite[MAXNMOLS * MAXNMOLSITES];	
+
+   // velocity statistics
+ 
+   double	dvel=0.001;
+   double	ave_vx, ave_vy, ave_vz;
+   double 	velmax=0.0, velmin=0.0;
+   double	vel_distx[101], vel_disty[101], vel_distz[101];
+ 
+   // variables to AVERAGE over a number of timesteps
+
+   long		*Nn;				// size dist. of nucleus size
+   long		ntot, maxnmax;			// total number of nuclei for normalization
+   float	*Rg2nucl;			// Rg2 of nucleus as a function of size
+
+   // dislocation location
+   double	xtop, xbot;
+   double	xdisl;
+   double	prev_xdisl = -1e6;
+
+   // pbc image variables
+   
+   long		imagen=0;
+   double	imagex, imagey, imagez;	
+
+   // LAMMPS variables
+
+   FILE 	*flmpin;
+   void		*lmp;
+   char 	line[1024];
+   double	*lammps_x;
+
+   if (M2HDEBUG) {
+      printf("variables declared.\n");
+      fflush(stdout);
+   }
+#ifdef myMPI
+   //MPI_Comm	comm_lammps;
+#endif
+
+   //------MPI initialization------//
+   //MPI_numprocs	=	1;			// default value
+   //MPI_myid	=	0;			// default value
+
+#ifdef myMPI
+   MPI_Init(&argc, &argv);
+   MPI_Comm_size(MPI_COMM_WORLD, &MPI_numprocs);
+   MPI_Comm_rank(MPI_COMM_WORLD, &MPI_myid);
+
+   comm_world = MPI_COMM_WORLD;
+   MPI_Comm_group(comm_world, &group_world);			// associate world comm with world group
+   MPI_Group_excl(group_world, 1, 0, &group_lammps);		// exclude proc.#0 from world group to form lammps group
+   MPI_Comm_create(comm_world, group_lammps, &comm_lammps);	// create lammps comm from world comm for lammps group
+
+   if (MPI_numprocs<2) {
+      printf("Error: MPI_numproc<2, cannot create new comm.\n");
+      fflush(stdout);
+      exit(0);
+   }
+#endif
+
+   if (argc<2 && MPI_myid==0) {
+      printf("metal2hst (c) 2014 by Peng Yi at JHU\n\n");
+      printf("Usage:\n");
+      printf("\tmetal2hst [-option] [x= 0.1 y= 0.1 z= 0.1 n= 1] [dn= 2 nfiles= 2] lammpsdumpfile(s)\n\n");
+      printf("Notes:\n");
+      printf("\t* -option = \n");
+      printf("\t* -pre: generate pre-analysis results\n");
+      printf("\t* -poly: polydisperse system, has molid in dump file\n");
+      printf("\t* -conf: configuration file output\n");
+      printf("\t* -car: car file output\n");
+      printf("\t* -pdb: pdb file output\n");
+      printf("\t* -xyz: xyz file output\n");
+      printf("\t* -lammps: invoke LAMMPS\n");
+      printf("\t* x= y= z=: duplicate the system and shift unit vector\n");
+      printf("\t* n=: multiple of shift vector\n");
+      printf("\t* start=: the timestep that analysis stops\n");
+      printf("\t* end=: the timestep that analysis stops\n");
+      printf("\t* dn=: only analyze every dn frames\n");
+      printf("\t* nfiles=: number of input files if more than 1 (must be <=32)\n");
+      printf("\t* \"=\" must immediately follow x or y or z or n or dn\n");
+      printf("\t* require setup file\n\n");
+      exit(1);
+   }
+
+   for (i=1; i<argc-1; i++) {
+      strcpy(par, argv[i]);
+      if(samestr(par, "-pre"))		preflag		=	1;
+      else if (samestr(par, "-conf"))	confflag	=	1;
+      else if (samestr(par, "-car"))	carflag		=	1;
+      else if (samestr(par, "-pdb"))	pdbflag		=	1;
+      else if (samestr(par, "-xyz"))	xyzflag		=	1;
+      else if (samestr(par, "-lammps"))	lammpsflag	=	1;
+      else if (samestr(par, "-Z"))	Zflag		=	1;
+      else if (samestr(par, "x="))	imagex		=	atof(argv[i+1]);
+      else if (samestr(par, "y=")) 	imagey		=	atof(argv[i+1]);
+      else if (samestr(par, "z=")) 	imagez		=	atof(argv[i+1]);
+      else if (samestr(par, "n=")) 	imagen		=	atol(argv[i+1]);
+      else if (samestr(par, "start=")) 	starttime	=	atol(argv[i+1]);
+      else if (samestr(par, "end=")) 	endtime		=	atol(argv[i+1]);
+      else if (samestr(par, "dn=")) 	dnframe		=	atol(argv[i+1]);
+      else if (samestr(par, "nfiles="))	nfiles		=	atoi(argv[i+1]);
+   }
+   if (nfiles > MAXNINPUTFILE) {
+      printf("Error! number of input files exceeds MAXNINPUTFILE\n");
+   }
+   for (i=0; i<nfiles; i++) {
+      strcpy(infile[nfiles-1-i], argv[argc-1-i]);	// get input filenames
+   }
+
+   if (M2HDEBUG) {					// DEBUG output
+      printf("command line read.\n");
+      fflush(stdout);
+   }
+
+#ifdef myMPI
+   if (lammpsflag) {
+      //MPI_Comm_split(MPI_COMM_WORLD, 1, 0, &comm_lammps);
+   }
+#endif
+
+   if (M2HDEBUG) {					// DEBUG output
+      printf("MPI split done.\n");
+      fflush(stdout);
+   }
+
+   //---------------------------//
+   //	Open output files	//
+   //---------------------------//
+ 
+   if (nfiles==1)	strcpy(filein, infile[0]);	// determine output filename
+   else			strcpy(filein, "multi");
+
+   sprintf(procid, ".%d", MPI_myid);			// MPI: proc id for output files
+
+#ifdef	myMPI
+   //if (MPI_myid==0) {					// ONLY process 0 do the following
+#endif
+
+   //------ Open optional output files ------//
+
+   if (xyzflag) {
+      strcpy(filename, filein);
+      strcat(filename, ".xyz");
+      strcat(filename, procid);
+
+      fxyz 	= 	fopen(filename, "w");
+      fcolor	=	fopen("color", "w");
+   }
+   if (carflag) {
+      strcpy(filename, filein);
+      strcat(filename, ".car");
+      strcat(filename, procid);
+
+      fcar 	= 	fopen(filename, "w");
+   }
+   if (pdbflag) {
+      strcpy(filename, filein);
+      strcat(filename, ".pdb");
+      strcat(filename, procid);
+
+      fpdb 	= 	fopen(filename, "w");
+   }
+
+#ifdef	myMPI
+   //}
+#endif
+
+   if (!M2HDEBUG) {			
+      strcpy(filename, filein);
+      strcat(filename, ".out");			// every processor does output
+      strcat(filename, procid);
+      freopen(filename, "w", stdout);		// redirect standard output stream to a file
+   }
+
+   if (M2HDEBUG) {					// DEBUG output
+      printf("i/o files ready.\n");
+      fflush(stdout);
+   }
+
+   //------ Write run info. to output file ------//
+
+   printf("# BEGINNING OF OUTPUT FILE\n");
+   printf("%s\n", asctime(localtime(&t)));
+
+   printf("# metal2hst version: %s\n", M2HVERSION);
+   printf("# command: ");
+   for (i=0; i<argc; i++) {	
+      printf("%s ", argv[i]);	
+   }
+   printf("\n");
+   printf("# number of processor:  %d\n", MPI_numprocs);
+   printf("# id of this processor: %d\n", MPI_myid);
+   printf("\n");
+   fflush(stdout);
+
+   prog_start	=	time(NULL);			// to calculate running time
+
+   //-------------------//
+   //	Initialization	//
+   //-------------------//
+
+   if (M2HDEBUG)	printf("DEBUG: Initialization ...\n");
+   /*
+   InitMols(MAXNMOLS, MAXNMOLS);	// allocate memory for molecules
+   GetSetup(argv);			// read in setup file
+   */
+   //InitUnits();				// initialize units for calculation
+   //InitForcefield();			// initialize Lennard-Jones potential mixing rule
+
+   system	=	0;		// for now 2/14/08, only one system
+
+   //InitSample();			// initialize sampling
+
+   nframe	=	-1;
+
+   //------ Initialize LAMMPS module ------//
+   
+   if (lammpsflag) {
+      int	lmpargc;		// command line for lammps
+      char	**lmpargv;
+       
+      lmpargc 	=	5;
+      if (lmpargc>1) {
+	 if ( (lmpargv = (char **)calloc(lmpargc, sizeof(char *)))==NULL) {
+	    printf("lmpargv allocation failed\n");
+	    exit(0);
+	 }
+	 for (i=0; i<lmpargc; i++) {
+	    if ( (lmpargv[i] = (char *)calloc(80, sizeof(char)))==NULL) {
+	       printf("lmpargv[%d] allocation failed\n", i);
+	       exit(0);
+	    }
+	 }
+	 strcpy(lmpargv[1], "-screen");
+	 strcpy(lmpargv[2], "none");
+	 strcpy(lmpargv[3], "-log");
+	 strcpy(lmpargv[4], "log.analysis");
+      }
+
+      if ( (flmpin = fopen("in.hybrid", "r"))==NULL) {
+	 printf("Error: analysis LAMMPS script not found.\n");	// open LAMMPS input script
+	 exit(9);
+      }
+
+      // lmpargc=0;
+      lammps_open(lmpargc, lmpargv, comm_lammps, &lmp);		// open a LAMMPS instance
+
+      while (1) {
+	 if (MPI_myid == 0) {
+	    if (fgets(line, 1024, flmpin) == NULL) n=0;
+	    else n=strlen(line);
+	    if (n==0) {fclose(flmpin);}
+	 }
+	 MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);		// pass command to all processors
+	 if (n==0) break;
+	 MPI_Bcast(line, n, MPI_CHAR, 0, MPI_COMM_WORLD);
+	 lammps_command(lmp, line);
+      }
+      //lammps_x  = (double *) calloc(3*NSITES, sizeof(double));
+      NSITES	= lammps_get_natoms(lmp);		// so that we don't need setup file anymore
+      
+   }
+   if (M2HDEBUG) {
+      printf("lammps script read.\n");
+      fflush(stdout);
+   }
+   
+   //------ Initialize system variables ------//
+
+   NMOLS	=	NSITES;
+   nsites	=	NSITES;
+
+   printf("NSITES = %d\n", NSITES);
+   printf("NMOLS = %d\n", NMOLS);
+   fflush(stdout);
+
+   if ( (mol = (molstruct*)calloc(NMOLS, sizeof(molstruct))) == NULL) {
+      printf("# mol allocation failed\n");
+      fflush(stdout);
+      exit(0);
+   }
+   if ( (oldmol = (molstruct*)calloc(NMOLS, sizeof(molstruct))) == NULL) {
+      printf("# oldmol allocation failed\n");
+      fflush(stdout);
+      exit(0);
+   }
+
+   if (M2HDEBUG) {
+      printf("mol and oldmol allocated.\n");
+      fflush(stdout);
+   }
+
+   //------ Initialize other variables ------//
+
+   Nn		=	(long *) calloc(NSITES, sizeof(long));
+   if (M2HDEBUG) {
+      printf("allocating Nn\n");
+      fflush(stdout);
+   }   
+   ntot		=	0;
+   maxnmax	=	0;
+   Rg2nucl	=	(float *) calloc(NSITES, sizeof(float));
+   if (M2HDEBUG) {
+      printf("allocating Rg2nucl\n");
+      fflush(stdout);
+   }   
+
+   //---------------------------//
+   //	Start Data Processing	//
+   //---------------------------//
+
+   for (ifile=0; ifile<nfiles; ifile++) {			// multiple input dump files
+
+      fin	=	fopen(infile[ifile], "r");
+
+      if (M2HDEBUG) printf("\n# Current dump file: %s\n", infile[ifile]);
+
+      while (!feof(fin)) {
+
+	 //------ Read one configuration from dump file	------//
+
+	 if (M2HDEBUG)	printf("\n# Reading one configuration ...\n");
+
+         if (!fgets(dummy, sizeof(dummy), fin))	{	// read one line, if NULL then break
+	    break;
+	 }
+	 if (strstr(dummy, "TIMESTEP")) {		// if this line contains string "TIMESTEP"
+	    fscanf(fin, "%ld", &timestep);		// read the next line for the value of timestep
+	    fgets(dummy, sizeof(dummy), fin);
+	 }
+	 printf("timestep = %d\n", timestep);
+	 fflush(stdout);
+
+	 //------ If first conf. read in to determine system variables used later ------//
+	 //------ otherwise let LAMMPS library functions handel the configuration ------//
+
+	 //if (firstconf) {
+	 //   firstconf = 0;				// do it only once
+
+	 fgets(dummy, sizeof(dummy), fin);						// line 3
+	 fscanf(fin, "%ld", &nsites);		fgets(dummy, sizeof(dummy), fin);	// line 4
+	 if (nsites!=NSITES) {
+	    printf("Error: nsites!=NSITES\n");
+	    fflush(stdout);
+	    exit(0);
+	 }
+
+	 fgets(dummy, sizeof(dummy), fin);						// line 5
+	 if (strstr(dummy, "xy"))	PBC = 3;	// PBC=3 for triclinic box
+
+	 fscanf(fin, "%lf%lf", &xlo, &xhi);						// line 6	
+	 if (PBC==3)	fscanf(fin, "%lf", &xy);
+	 else 		xy = 0.0;
+	 fgets(dummy, sizeof(dummy), fin);
+
+	 fscanf(fin, "%lf%lf", &ylo, &yhi);						// line 7
+	 if (PBC==3) 	fscanf(fin, "%lf", &xz); 	
+	 else		xz = 0.0;
+	 fgets(dummy, sizeof(dummy), fin);
+
+	 fscanf(fin, "%lf%lf", &zlo, &zhi);						// line 8
+	 if (PBC==3) fscanf(fin, "%lf", &yz);
+	 else	yz = 0.0;
+	 fgets(dummy, sizeof(dummy), fin);
+	 fgets(dummy, sizeof(dummy), fin);						// line 9
+
+	 // calculate box dimension, triclinic in general
+
+         // xhi, xlo, etc in dump file are actually xhi_bound, xlo_bound, etc.
+         // ... need to convert to cell vectors
+	 xlo -= MIN(0.0, MIN(xy, MIN(xz, xy+xz)));
+	 xhi -= MAX(0.0, MAX(xy, MAX(xz, xy+xz)));
+	 ylo -= MIN(0.0, yz);
+	 yhi -= MAX(0.0, yz);
+
+	 system = 0;
+	 BOX[system].lx = xhi-xlo;
+	 BOX[system].ly = yhi-ylo;
+	 BOX[system].lz = zhi-zlo;
+	 BOX[system].xy = xy;
+	 BOX[system].xz = xz; 
+	 BOX[system].yz = yz;
+
+         if (fabs(xy) < ZERO && fabs(xz) < ZERO && fabs(yz) < ZERO) {
+	    PBC	=	1;						// for cell list to operate
+	 }
+    
+         // read atom information
+
+	 LENGTH		=	NSITES/NMOLS;		// monodisperse system for now (4/26/2008)
+
+	 for (i=0; i<nsites; i++) {
+	    fscanf(fin, "%ld", &id);
+	    fscanf(fin, "%ld", &type);
+
+	    fscanf(fin, "%lf%lf%lf", &x, &y, &z);
+	    //fscanf(fin, "%d%d%d", &nx, &ny, &nz);
+	    nx = 0;					// assuming unwrapped coordinates in dump file
+	    ny = 0;
+	    nz = 0;
+	    
+	    //fscanf(fin, "%lf%lf%lf %lf%lf%lf %d%d%d", &x, &y, &z, &vx, &vy, &vz, &nx, &ny, &nz);
+	    fscanf(fin, "%lf", &tmp1);
+	    fscanf(fin, "%lf", &tmp2);
+	    fscanf(fin, "%lf", &tmp3);
+	    //fscanf(fin, "%d", &itmp2);
+	    fgets(dummy, sizeof(dummy), fin);
+
+	    id	--; 					// -1 because lammps index starts from 1
+	    molid	=	(long) (id/LENGTH);
+	    siteid	=	id % LENGTH;
+
+            // box id and chain length
+	    mol[molid].box	=	system;		// for now, only one system
+	    mol[molid].nsites	=	LENGTH;		// for now, Jan/10/2010
+
+	    // atom type 
+	    mol[molid].type[siteid]	=	type - 1;	// -1 because lammps index starts from 1
+
+	    // general triclinic box
+	    mol[molid].p[siteid].x	=	x + nx*(BOX[system].lx) 
+						  + ny*(BOX[system].xy) + nz*(BOX[system].xz);
+	    mol[molid].p[siteid].y	=	y + ny*(BOX[system].ly) + nz*(BOX[system].yz);
+	    mol[molid].p[siteid].z	=	z + nz*(BOX[system].lz);
+
+	    // for density profile calculation
+	    rsite[i].x	=	x;
+	    rsite[i].y	=	y;
+	    rsite[i].z	=	z;
+    
+	    // velocity
+	    mol[molid].velx[siteid]	=	vx;
+	    mol[molid].vely[siteid]	=	vy;
+	    mol[molid].velz[siteid]	=	vz;
+
+	    // atom potential energy
+	    mol[molid].pe[siteid]	=	tmp1;
+	    mol[molid].cna[siteid]	=	(int) tmp2;
+	    mol[molid].centro[siteid]	=	tmp3;
+
+	 }	// one configuration read
+
+	 // collect system information
+
+	 for (i=0; i<NSYSTEMS; i++) {
+	    NMols[i]	=	0;
+	    NSites[i]	=	0;
+	 }
+	 for (moli=mol; moli<mol+NMOLS; moli++) {
+	    if ( (i=moli->box) >= 0) {
+	       NMols[i]	++;				// total # of mols in certain system
+	       NSites[i]	+=	moli->nsites;	// total # of sites in certain system
+	    }
+	 }
+
+	 for (moli=mol; moli<mol+NMOLS; moli++) {
+	    for (i=0; i<moli->nsites; i++)  {
+	       moli->flags[i]	=	1;		// activate all the sites on this processor
+	       moli->parent[i]	=	i-1;		// initialize parent site
+	    }
+	    moli->flip		=	0;		// flip to the original direction
+	    moli->origin	=	CenterofMass(moli);
+	 }
+
+         //-----------------------------//
+	 //	Check timestep range	//
+         //-----------------------------//
+
+	 if (timestep < starttime) {			// starttime = -1 by default
+	    continue;
+	 }
+	 if (endtime > 0 && endtime < timestep) {	// endtime = -1 by default
+	    break;
+	 }
+
+	 //------ Skip repeated frames from different input files ------//
+
+	 if (ifile>=1 && timestep == previous_timestep) {
+	    continue;
+	 }
+	 previous_timestep	=	timestep;	// check repeat frames
+
+	 //------ Skip (dnframe - 1) frames ------//
+
+	 nframe	++;
+	 if (nframe%dnframe)	continue;		// analyze every dnframe frames
+	
+	 //-----------------------------------------------------//
+	 //	Call LAMMPS module				//
+	 //     - Feed coordinates to LAMMPS module		//
+	 //	- Do calculation using LAMMPS			//
+	 // 	- Extract computation results			//
+	 //-----------------------------------------------------//
+lammpsmodule:
+
+         if (lammpsflag) {
+	    if (M2HDEBUG) {
+	       printf("DEBUG: call LAMMPS module ...\n");
+	       fflush(stdout);
+	    }
+	   
+	    // store coordinates from the dynamics simulation trajectory
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  r_MD[n]	=	moli->p[i].x;
+		  r_MD[n+1]	=	moli->p[i].y;
+		  r_MD[n+2]	=	moli->p[i].z;
+		  n	+=	3;
+	       }
+	    }
+
+	    /*
+	    // pass coordinates to LAMMPS
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  lammps_x[n]	=	moli->p[i].x;
+		  lammps_x[n+1]	=	moli->p[i].y;
+		  lammps_x[n+2]	=	moli->p[i].z;
+		  n	=	n+3;
+	       }
+	    }
+	    lammps_scatter_atoms(lmp, "x", 1, 3, lammps_x);
+	    */
+
+	    // pass atoms and box to LAMMPS
+	    sprintf(s, "read_dump %s %ld x y z wrapped no", infile[ifile], timestep);	// read atoms / box from dump file
+	    lammps_command(lmp, s); 
+
+	    //--- Do run or minimization in LAMMPS
+	    //lammps_command(lmp, "minimize 1e-10 1e-10 1000 10000");
+
+	    //lammps_command(lmp, "fix 1 all nve");	// keep computes and thermo variables current
+	    lammps_command(lmp, "run 0");		// keep computes and thermo variables current
+
+
+            //--- extract thermo data
+	    lammps_extract_thermo(lmp, "pe", &tmp1);
+	    printf("timestep %d potential energy = %f\n", timestep, tmp1);
+	    fflush(stdout);
+
+	    //--- obtain coordinates (wrapped) from LAMMPS
+	    /*
+	    lammps_gather_atoms(lmp, "x", 1, 3, lammps_x);
+	    
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->p[i].x	=	lammps_x[n];
+		  moli->p[i].y	=	lammps_x[n+1];
+		  moli->p[i].z	=	lammps_x[n+2];
+		  n	=	n+3;
+	       }
+	    }
+	    */
+
+ 	    //--- obtain compute results
+	    printf("# lammps module extract compute rdf.\n");
+	    fflush(stdout);
+	    data2D	=	lammps_extract_compute(lmp, "myRDF", 0, 2);
+	    if (data2D == NULL) {
+	       printf("\n# Error: compute myRDF not found.\n");
+	       fflush(stdout);
+	    }
+	    /*
+	    for (i=0; i<50; i++) {
+	       printf("%f %f %f\n", data2D[i][0], data2D[i][1], data2D[i][2]);
+	    }
+	    fflush(stdout);
+	    */
+
+
+	    //--- obtain compute results
+	    printf("# lammps module extract compute pe/atom.\n");
+	    fflush(stdout);
+	    data1D	=	lammps_extract_compute(lmp, "pe", 1, 1);
+	    if (data1D == NULL) {
+	       printf("\n# Error: compute pe not found.\n");
+	       fflush(stdout);
+	    }
+	    n	=	0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->pe[i]	=	data1D[n];
+		  n++;
+	       }
+	    }
+
+	    //--- obtain compute results
+	    printf("# lammps module extract compute nneigh/atom.\n");
+	    fflush(stdout);
+	    data1D	=	lammps_extract_compute(lmp, "nneigh", 1, 1);
+	    if (data1D == NULL) {
+	       printf("\n# Error: compute nneigh not found.\n");
+	       fflush(stdout);
+	    }
+	    n	=	0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->nneigh[i]	=	data1D[n];
+		  n++;
+	       }
+	    }
+
+	    //--- obtain compute results
+	    printf("# lammps module extract compute cna/atom.\n");
+	    fflush(stdout);
+	    data1D	=	lammps_extract_compute(lmp, "cna", 1, 1);
+	    if (data1D == NULL) {
+	       printf("\n# Error: compute cna not found.\n");
+	       fflush(stdout);
+	    }
+	    n	=	0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->cna[i]	=	data1D[n];
+		  n++;
+	       }
+	    }
+
+	    //--- obtain compute results
+	    printf("# lammps module extract compute centro/atom.\n");
+	    fflush(stdout);
+	    data1D	=	lammps_extract_compute(lmp, "centro", 1, 1);
+	    if (data1D == NULL) {
+	       printf("\n# Error: compute centro not found.\n");
+	       fflush(stdout);
+	    }
+	    n	=	0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->centro[i]	=	data1D[n];
+		  n++;
+	       }
+	    }
+
+	    //--- extract atom id since LAMMPS does not sort atoms automatically
+	    lmp_atomid	=	lammps_extract_atom(lmp, "id");
+	    for (i=0; i<NSITES; i++) {
+	       if ( lmp_atomid[i] != i+1 ) {
+		  printf("%d %d\n", i, lmp_atomid[i]);
+	       }
+	    }
+
+	    //--- obtain atom types
+	    printf("# lammps module extract atom type.\n");
+	    fflush(stdout);
+	    ldata1D	=	lammps_extract_atom(lmp, "type");
+
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  /* 
+			if (ldata1D[n] != moli->type[i]+1) {
+			   printf(" Type error, 1data1D[%d]=%d, mol[%d]->type[%d]+1=%d\n", 
+				   n, ldata1D[n], moli-mol, i, moli->type[i]+1);
+			   fflush(stdout);
+			   exit(0);
+			}
+	          */
+		  for (j=0; j<NSITES; j++) {
+		     if ( lmp_atomid[j] == n+1 ) {		// lammps atom id starts from 1
+			if (ldata1D[j] != moli->type[i]+1) {
+			   printf(" Type error, 1data1D[%d]=%d, mol[%d]->type[%d]+1=%d\n", 
+				   j, ldata1D[j], moli-mol, i, moli->type[i]+1);
+			   fflush(stdout);
+			   exit(0);
+			}
+			break;
+		     }
+		  }
+		  n++;
+	       }
+	    }
+
+	    //--- obtain unwrapped atom coordinates
+	    printf("# lammps module extract unwrapped atom coord.\n");
+	    fflush(stdout);
+	    data2D	=	lammps_extract_compute(lmp, "unwrap", 1, 2);
+	    //data2D	=	lammps_extract_atom(lmp, "x");
+	    if (data2D == NULL) {
+	       printf("\n# Error: compute unwrap not found.\n");
+	       fflush(stdout);
+	    }
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  moli->p[i].x	=	data2D[n][0];
+		  moli->p[i].y	=	data2D[n][1];
+		  moli->p[i].z	=	data2D[n][2];
+		  //printf("%d %f %f\n", n, moli->p[i].z, data2D[n][2]);
+		  n	++;
+	       }
+	    }
+
+	    //--- locate dislocation for velocity calculation
+            n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  if (moli->cna[i]==1) {
+		     nucleus[n].moli = moli;
+		     nucleus[n].site = i;
+		     n ++;
+		  }
+	       }
+	    }
+	    Rconn = 6.0;
+
+printf("b4 MapInNucleus\n");
+fflush(stdout);
+	    MapInNucleus(system, nucleus, n, rbead);	// continuous coordinates in rbead
+printf("after MapInNucleus\n");
+fflush(stdout);
+exit(0);
+	    xdisl = 0.0;
+	    for (i=0; i<n; i++) {
+	       xdisl += rbead[i].x;
+	    }
+	    xdisl /= n;
+
+	    if (prev_xdisl > -1e5) {		// not the first time
+	       vtmp.x = xdisl-prev_xdisl;
+	       vtmp.y = 0.0;
+	       vtmp.z = 0.0;
+	       vtmp = MapInBox2(&vtmp, PBC, system);
+
+	       xdisl = prev_xdisl + vtmp.x;
+	    }
+
+	    lammps_extract_thermo(lmp, "pxz", &tmp1);	// pxz calc. from Virial
+
+	    tmptr = (double *)lammps_extract_variable(lmp, "mobile_pxz", NULL);
+	    tmp2 = *tmptr;
+	    tmptr = (double *)lammps_extract_variable(lmp, "boundary_pxz", NULL);
+	    tmp3 = *tmptr;
+
+            tmptr = (double *) lammps_extract_compute(lmp, "fx_top", 0, 0);
+	    tmp4 = *tmptr;
+            tmptr = (double *) lammps_extract_compute(lmp, "fx_bot", 0, 0);
+	    tmp5 = *tmptr;
+	    tmptr = (double *) lammps_extract_variable(lmp, "stress_top", NULL);
+	    tmp6 = *tmptr;
+	    tmptr = (double *) lammps_extract_variable(lmp, "stress_bot", NULL);
+	    tmp7 = *tmptr;
+
+	    printf("disl: %d %f %f %f %f %f %f %f", timestep, tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7);
+	    printf(" %f %f\n", xdisl, xdisl-prev_xdisl);
+	    fflush(stdout);
+	    prev_xdisl = xdisl;
+
+	    // store coordinates of the minimized trajectory
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  r_MIN[n]	=	moli->p[i].x;
+		  r_MIN[n+1]	=	moli->p[i].y;
+		  r_MIN[n+2]	=	moli->p[i].z;
+		  n	+=	3;
+	       }
+	    }
+
+	    /*
+	    printf("lmp_atom_id\tx\ty\tz\tpe\tnneigh\tcna\tcentro\n");
+	    for (moli=mol; moli<mol+NMOLS; moli++) {
+	       for (i=0; i<moli->nsites; i++) {
+		  printf("%d", moli-mol+1);
+		  printf("\t%10.6f", moli->p[i].x);
+		  printf("\t%10.6f", moli->p[i].y);
+		  printf("\t%10.6f", moli->p[i].z);
+		  printf("\t%10.6f", moli->pe[i]);
+		  printf("\t%d", moli->nneigh[i]);
+		  printf("\t%1.0f", (float)moli->cna[i]);
+		  printf("\t%6.4f", moli->centro[i]);
+		  printf("\n");
+	       }
+	    }
+	    fflush(stdout);
+	    */
+
+	 }	// LAMMPS Module done
+
+	 printf("\n# LAMMPS module completed.\n");
+	 fflush(stdout);
+	 exit(0);
+
+goto	output_conf;		// most of the analysis is done through LAMMPS functions
+
+	 // CoorSI2System();		// Convert {x, y, z}'s, lx, ly, lz and lbox
+
+	 // Calculate other length scales
+	 for (i=0; i<NSYSTEMS; i++) {	
+	    BOX[i].lbox		=	MIN(MIN(BOX[i].lx, BOX[i].ly), BOX[i].lz);
+	    BOX[i].vol		=	BOX[i].lx * BOX[i].ly * BOX[i].lz;
+	    BOX[i].rc		=	MIN(0.5*BOX[i].lbox, Rc);
+	    BOX[i].rb		=	Rb;
+	    BOX[i].rv		=	Rv;
+	 }
+	 // radial("sample");		// sample radial distribution function
+
+	 //-----------------------------//
+	 //	Build cell list		//
+	 //-----------------------------//
+#ifdef CELL_LIST
+	 if (M2HDEBUG)	printf("DEBUG: build cell list ...\n");
+
+	 if (clistinit) {
+	    CL_Init();
+	    CL_Build();
+	    clistinit = 0;
+	 }
+	 /*
+	 if (!clistinit) {
+	    CL_Destroy();
+	 }
+	 clistinit = 0;
+
+	 CL_Init();		// need to init. cell list every time due to volume change
+	 CL_Build();
+         */
+#endif	/* CELL_LIST */
+
+	 //-----------------------------//
+	 //	Perform analysis	// 
+	 //-----------------------------//
+
+	 if (M2HDEBUG)	printf("DEBUG: perform analysis ...\n");
+
+	 //------ Convert to Z-code input file ------//
+	 
+	 //------ Calculate common neighborhood parameter (CNP) ------//
+
+	 if (M2HDEBUG)	printf("DEBUG: atom_neighbor() ...\n");
+	 //atom_neighbor();					// find nearest neighbors
+
+	 if (M2HDEBUG)	printf("DEBUG: comm_neigh_para() ...\n");
+	 //comm_neigh_para();					// calculate CNP
+	 
+	 //------ Print out some results ------//
+
+	 printf("lmp_atom_id\tpe\tcna\tcnp\tnneigh\n");
+         for (moli=mol; moli<mol+NMOLS; moli++) {
+	    for (i=0; i<moli->nsites; i++) {
+	       //if (moli->type[i]==3) {
+	       if (displayatom(moli-mol)) {
+		  printf("%d", i+1);
+		  printf("\t%f ", moli->pe[i]);
+	          //printf("%f ", moli->rmin[i]);
+		  //printf("%f ", moli->rmax[i]);
+		  //printf("%f ", moli->rave[i]);
+		  printf("\t%d", moli->cna[i]);
+		  printf("\t%f", moli->cnp[i]);
+		  printf("\t%d", moli->nneigh[i]);
+		  printf("\n");
+	       }
+	    }
+	 }
+	 fflush(stdout);
+
+	 //--- shift coordinates so that the com of normal atoms is at the origin
+	 //shift_coord();
+	
+	 //--- Output the position of each column of atoms
+	 //monitor_coord();
+
+	 //------ Calculate hyper-distance ------//
+
+	 if (!confinit ) {
+	    
+	    if (lammpsflag) {
+	       // calculate hyper distance between MD and minimized configuration
+	       m	=	0;
+	       n	=	0;
+	       for (moli=mol; moli<mol+NMOLS; moli++) {
+		  for (i=0; i<moli->nsites; i++) {
+
+		     if (moli->cnp[i] > 24) {
+			r_ref[n]	=	r_MIN[m];
+			r_ref[n+1]	=	r_MIN[m+1];
+			r_ref[n+2]	=	r_MIN[m+2];
+
+			r_trj[n]	=	r_MD[m];
+			r_trj[n+1]	=	r_MD[m+1];
+			r_trj[n+2]	=	r_MD[m+2];
+			
+			n	+=	3;
+		     }
+		     m	+=	3;
+		  }
+	       }
+	       printf("MD-MIN hyper-distance = %f\n", hyper_distance(n, r_ref, r_trj));
+	       printf("MD-MIN slip-distance = %f\n", slip_distance(n, r_ref, r_trj));
+            }
+
+	    n = 0;
+	    for (moli=oldmol; moli<oldmol+NMOLS; moli++) {	// previous conf.
+	       for (i=0; i<moli->nsites; i++) {
+		  if (moli->type[i]==3) {
+		     r_ref[n]	=	moli->p[i].x;
+		     r_ref[n+1]	=	moli->p[i].y;
+		     r_ref[n+2]	=	moli->p[i].z;
+		     n	+=	3;
+		  }
+	       }
+	    }
+
+	    n = 0;
+	    for (moli=mol; moli<mol+NMOLS; moli++) {		// current conf.
+	       for (i=0; i<moli->nsites; i++) {
+		  if (moli->type[i]==3) {
+		     r_trj[n]	=	moli->p[i].x;
+		     r_trj[n+1]	=	moli->p[i].y;
+		     r_trj[n+2]	=	moli->p[i].z;
+		     n	+=	3;
+		  }
+	       }
+	    }
+
+	    printf("incremental hyper-distance = %f\n", hyper_distance(n, r_ref, r_trj));
+	    printf("incremental slip-distance = %f\n", slip_distance(n, r_ref, r_trj));
+	    fflush(stdout);
+
+	    /*
+	    for (i=0; i<NSITES; i++) {
+	       r_trjold[i]	=	r_trj[i];
+	       r_refold[i]	=	r_ref[i];
+	    }
+	    */
+	 }
+
+	 //------ Identify and group atoms in dislocations/partials ------//
+
+	 find_nuclei_general("cnp");
+
+         float	x1=0, x2=0;
+	 int	n1=0, n2=0;
+	 for (moli=mol; moli<mol+NMOLS; moli++) {
+	    for (i=0; i<moli->nsites; i++) {
+	       //if (moli->type[i]==0) {
+	       if (moli->type[i]==3) {
+		  if (moli->nuclid[i]==1) {
+		     x1	+=	moli->p[i].x;
+		     n1	++;
+		  }
+		  else if (moli->nuclid[i]==2) {
+		     x2	+=	moli->p[i].x;
+		     n2	++;
+		  }
+	       }
+	    }
+	 }
+	 if (x1/n1 < x2/n2) {
+	    printf("dislocation %d %d %f %d %f %d\n", timestep, n1, x1/n1, n2, x2/n2, Nnucl[0]);
+	 }
+	 else {
+	    printf("dislocation %d %d %f %d %f %d\n", timestep, n2, x2/n2, n1, x1/n1, Nnucl[0]);
+	 }
+	 fflush(stdout);
+
+	 //-------------------------------------//
+	 //	Output configuration files	//
+	 //-------------------------------------//
+output_conf:
+	 if (M2HDEBUG)	printf("\n# Output configuration files ...\n");
+
+         if (xyzflag) {
+	    output_xyzfile(fxyz, fcolor);
+	 }
+	 if (carflag) {
+	    output_carfile(fcar);
+	 }
+	 if (pdbflag) {
+	    output_pdbfile(fpdb);
+	 }
+
+	 //-------------------------------------//
+	 //	Finish analysis and clean-up	//
+	 //-------------------------------------//
+	 for (i=0; i<NMOLS; i++) {
+	    oldmol[i]	=	mol[i];		// save molecules information
+	 }
+
+	 if (confinit) {	// at least one conf. read
+	    confinit	=	0;
+	 }
+
+	 //}			// if line contains string "TIMESTEP"
+	 
+      } 			// finish ONE input dump file
+
+      fclose(fin);		// close current input dump file
+
+   }				// finish ALL input dump files
+
+   //-------------------------------------------------------------------//
+   //	Output final analysis results after ALL frames processed	//
+   //-------------------------------------------------------------------//
+   if (M2HDEBUG)	printf("DEBUG: ALL FRAMES PROCESSED ...\n");
+
+   //------Frame information------//
+
+   printf("\n# OUTPUT AFTER ALL FRAMES ARE PROCESSED\n\n");
+   printf("START TIMESTEP\t%d\n", starttime);
+   printf("END TIMESTEP\t%d\n", endtime);
+   printf("TOTAL FRAMES\t%d\n", nframe+1);
+   printf("ANALYZE EVERY\t%d\n", dnframe);
+   printf("ANALYZED FRAMES\t%d\n", nframe/dnframe+1);
+
+   //radial("print");		// print out radial distribution function
+
+   //-------------------//
+   //	Closing files	//
+   //-------------------//
+   if (M2HDEBUG)	printf("DEBUG: Close output files ...\n");
+
+   prog_end	=	time(NULL);
+   
+   printf("\n# END OF OUTPUT FILE\n");
+   printf("%s", asctime(localtime(&prog_end)));
+   printf("\nTotal running time was %lf seconds.\n", difftime(prog_end, prog_start));
+
+   if (xyzflag) {
+      fclose(fxyz);
+      fclose(fcolor);
+   }
+   if (carflag) {
+      fclose(fcar);
+   }
+   if (pdbflag) {
+      fclose(fpdb);
+   }
+
+/*
+   if (lammpsflag) {
+      lammps_close(lmp);			// close LAMMPS instance
+   }
+*/
+#ifdef myMPI
+   MPI_Finalize();
+#endif
+   return	0;
+}	
+//------MAIN program ends------//
+
+//======================//
+//	SUBROUTINES	//
+//======================//
+
+//==============================================//
+//	Output variables for each chain 	//
+//	-- Rg, segment info. etc.		//
+//	-- output format made similar		//
+//	-- to .pre, so that they can		//
+//	-- be easily merged			//
+//==============================================//
+
+//======================================================================//
+//	output_pre(): write pre-analysis results for further analysis	//
+//	              These pre-results should be basic but very	//
+//		      time-consuming.  So by saving these results in	//
+//		      a pre- file we can reuse them later without 	//
+//		      calculating them every time.			//
+//======================================================================//
+
+//==============================================================//
+//	read_pre(): read pre-analysis results, see output_pre()	//
+//==============================================================//
+
+//==============================================================//
+//	output_xyzfile(): write configuration to .xyz file	//
+//			  also output a scalar value for each	//
+//			  atom for color display in VMD		//
+//==============================================================//
+void output_xyzfile(FILE *fPtr, FILE *fclr)
+{
+   molstruct	*moli;
+   vector	p;
+   int		i, n, N;
+   int		system=0;
+   static int	init;
+   static float	*color_par;
+   float	tmp1, tmp2, tmp3;
+
+   if (init) {
+      init	=	0;
+      color_par	=	(float *)calloc(NMOLS, sizeof(float));
+   }
+
+   //--- count the number of atoms to display
+   N	=	0;
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      n	=	moli-mol;
+      //if (moli->type[0]>=3 && displayatom(n)) {
+      if (displayatom(n) ) {
+	 N	++;
+      }
+   }
+
+   //--- print the header of each configuration
+   fprintf(fPtr, "%d\n", N);
+   fprintf(fPtr, "comments......\n");
+
+   //--- print the xyz coordinates of atoms to display
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+
+      n	=	moli-mol;
+
+      //if (moli->type[0]>=3 && displayatom(n)) {
+      if (displayatom(n)) {
+	 for (i=0; i<moli->nsites; i++) {
+	    //p	=	MapInBox2(moli->p+i, PBC, system);
+	    //fprintf(fPtr, "O %f %f %f\n", p.x, p.y, p.z);
+	    //fprintf(fPtr, "O %f %f %f\n", moli->p[i].x - mol->p[0].x, moli->p[i].y-mol->p[0].y, moli->p[i].z-mol->p[0].z);
+	    //if (moli->cna[i] > 2.05 || moli->cna[i] < 1.95) { 
+	    if (moli->cna[i] > 2.5 || moli->cna[i]<1.5) { 
+	       fprintf(fPtr, "O %f %f %f\n", moli->p[i].x, moli->p[i].y, moli->p[i].z);
+	    }
+	    else {
+	       fprintf(fPtr, "N %f %f %f\n", moli->p[i].x, moli->p[i].y, moli->p[i].z);
+	    }
+	 }
+      }
+   }
+   fflush(fPtr);
+
+   //--- calculate the coloring parameter
+
+   //--- find min and max for coloring parameter
+   tmp1	=	1.0e8;
+   tmp2	=	-1.0e8;
+
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      n	=	moli-mol;
+      //if (moli->type[0]==0 && displayatom(moli-mol)) {
+      //if (moli->type[0]>=3 && displayatom(moli-mol)) {
+      if (displayatom(n)) {
+	 tmp3	=	moli->nneigh[0];
+	 tmp3	=	moli->pe[0];
+	 tmp3	=	moli->cna[0];
+	 tmp3	=	moli->rmax[0]-moli->rmin[0];
+	 tmp3	=	moli->rmax[0];
+	 tmp3	=	moli->rmin[0];
+	 tmp3	=	moli->cnp[0];
+
+	 if (tmp1 > tmp3) {
+	    tmp1 = tmp3;		// min
+	 }
+	 if (tmp2 < tmp3) {
+	    tmp2 = tmp3;		// max
+	 }
+      }
+   }
+
+   // print the coloring parameter for display in VMD
+
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      tmp3	=	moli->nneigh[0];
+      tmp3	=	moli->pe[0];
+      tmp3	=	moli->cna[0];
+      tmp3	=	moli->rmax[0]-moli->rmin[0];
+      tmp3	=	moli->rmax[0];
+      tmp3	=	moli->rmin[0];
+      tmp3	=	moli->cnp[0];
+
+      n	=	moli-mol;
+      //if (moli->type[0]==0 && displayatom(moli-mol)) {
+      //if (moli->type[0]>=3 && displayatom(moli-mol)) {
+      if (displayatom(n)) {
+	 tmp3	=	0.7 * (tmp3 - tmp1)/(tmp2-tmp1);
+	 //tmp3	=	0.7/35*(tmp3-5);		//cnp
+      }
+
+      //if (moli->type[0]!=0)	tmp3 = 0.8;
+      //if (moli->type[0]<3)	tmp3 = 0.8;
+
+      //if (displayatom(moli-mol)) {
+      //if (moli->type[0]>=3&&displayatom(moli-mol)) {
+
+      if (moli->cna[0] > 2.5 || moli->cna[0]<1.5) { 
+	 tmp3	=	0.6;
+      }
+      else {
+	 tmp3	=	0.1;
+      }
+
+      if (displayatom(n)) {
+	 //fprintf(fclr, "%f ", tmp3);
+      }
+      //printf("pe %f\n", tmp3);
+      //printf("cnp %f\n", tmp3);
+   }
+   fprintf(fclr, "\n");
+   fflush(fclr);
+   return;
+}
+
+//==============================================================//
+//	output_carfile(): write configuration to .car file	//
+//==============================================================//
+void output_carfile(FILE *fPtr)
+{
+   time_t	t	=	time(NULL);
+   molstruct	*moli;
+   char		s[80], ff[80];
+   int		system = 0;			// only one box for now (11/18/2011)
+   int		i, n;
+
+   fprintf(fPtr, "!BIOSYM archive 3\n");
+   fprintf(fPtr, "PBC=ON\n");
+   fprintf(fPtr, "!TIMESTEP %ld\n", timestep);
+   fprintf(fPtr, "!DATE %s", asctime(localtime(&t)));
+   fprintf(fPtr, "PBC %9.7g %9.7g %9.7g %9.7g %9.7g %9.7g (P1)\n", 
+		BOX[system].lx, BOX[system].ly, BOX[system].lz, 90.0, 90.0, 90.0);
+
+   n	=	0;
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      if (system==moli->box) {
+
+         //MolInBox2(moli);
+         for (i=0; i<moli->nsites; i++) {
+            //moli->p[i] = MapInBox2(moli->p+i, PBC, system); //temporary
+
+            if (moli->cna[i]>1.5)		
+               sprintf(s, "O%d", n++);			// O: default red color in VMD
+            else
+               sprintf(s, "N%d", n++);			// N: default blue color in VMD
+
+	    sprintf(s, "N");			// N: default blue color in VMD
+
+	    /*
+            if (sizeofnucl[moli->nuclid[i]] == MAXSIZE[system])		// note nuclid index starts from 1
+               sprintf(s, "M%ld", n++);
+            else if (sizeofnucl[moli->nuclid[i]] -MAXSIZE[system] > -3 && MAXSIZE[system]>=10)
+               sprintf(s, "C%ld", n++);
+            else if (moli->nuclid[i] >= 1)
+               sprintf(s, "O%ld", n++);
+            else
+               sprintf(s, "H%ld", n++);
+	    */
+
+            fprintf(fPtr, "%-5.5s ", s);
+            sprintf(s, "M%ld", moli-mol);
+            fprintf(fPtr, "%14.8g %14.8g %14.8g ", moli->p[i].x, moli->p[i].y, moli->p[i].z);
+            strcpy(ff, "O");
+            fprintf(fPtr, "%-4.4s%-6ld ND       C 0.000\n", ff, moli-mol);
+         } 
+      }   
+   }
+   fprintf(fPtr, "end\nend\n");
+   fflush(fPtr);
+   return;
+}
+
+//======================================================================//
+//	output_pdbfile(): write configuration to pdb file and vmd files	//
+//======================================================================//
+void output_pdbfile(FILE *fPtr) 
+{
+   time_t	t	=	time(NULL);
+   molstruct	*moli;
+   char		atomname;
+   int		system = 0;			// only one box for now (11/18/2011)
+   int		i, m, n;
+   int		drawmol;
+   int		nuclid;
+
+   fprintf(fPtr, "HEADER: file created on %s", asctime(localtime(&t)));
+   fprintf(fPtr, "HEADER: timestep %d\n", timestep);
+   fprintf(fPtr, "CRYST1%9.4f%9.4f%9.4f%7.2f%7.2f%7.2f P 1           1\n", 
+        	BOX[system].lx, BOX[system].ly, BOX[system].lz,	90.0, 90.0, 90.0);
+
+   m		=	0;			// molecule sequence number
+   n		=	0;			// atom sequence number
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      if (system==moli->box) {
+         //MolInBox2(moli);
+
+         drawmol	=	0;
+         for (i=0; i<moli->nsites; i++) {
+	    nuclid	=	moli->nuclid[i];
+            if (sizeofnucl[nuclid] == nmax[system][0]) {	// part of the largest nucleus
+               drawmol	=	1;
+               break;
+            }
+	 }
+
+         m	++; 
+         for (i=0; i<moli->nsites; i++) {
+	    /*
+            if (drawmol) {
+	       nuclid	=	moli->nuclid[i];
+               if (sizeofnucl[nuclid] == nmax[system][0]) {	// nuclid index starts from 1
+                  atomname	=	'N';			// N: blue color in VMD
+                  fprintf(fdat, " 10");
+               }
+               else {
+                  atomname	=	'O';			// O: red color in VMD
+                  fprintf(fdat, " 0");
+               }
+            }
+            else {
+	       atomname	=	'C';				// C: cyan color in VMD
+	       fprintf(fdat," -1");
+	    }
+	    */
+	    //if ( moli->nneigh[i]>10 && (moli->cna[i]>2.5 || moli->cna[i]<1.5) ) {
+	    if ( moli->nneigh[i]>10 && (moli->cna[i]>1.5) ) {
+	       atomname	=	'O';
+	    }
+	    else {
+	       atomname	=	'N';
+	    }
+
+            n	++;
+	    fprintf(fPtr, "ATOM  ");			// pdb command, column 1-6
+            fprintf(fPtr, "%5d ", n);			// atom number
+            fprintf(fPtr, " %c  ", atomname);		// atom name
+            fprintf(fPtr, " ");				// alternate location indiator
+  	    fprintf(fPtr, "ILE");			// residue name
+	    fprintf(fPtr, " ");				// column 21
+            fprintf(fPtr, "A");				// chain identifier, column 22
+	    //fprintf(fPtr, "%4d", m);			// residue sequence number, 23-26
+	    fprintf(fPtr, "%4d", 1);			// residue sequence number, 23-26
+	    fprintf(fPtr, " ");				// code for insertion of residues, 27
+            fprintf(fPtr, "   ");			// column 28-30
+            fprintf(fPtr, "%8.3f%8.3f%8.3f", moli->p[i].x, moli->p[i].y, moli->p[i].z);
+            fprintf(fPtr, "%6.2f%6.2f", 1.0, 0.0);	// occupance and temperature
+            fprintf(fPtr, "%5.5s      %c", "", atomname);
+            fprintf(fPtr, "\n"); 
+
+	    /*
+            if (imgn) {			// for image box
+               n	++;
+               fprintf(fPtr, "ATOM  ");
+               fprintf(fPtr, "%5d ", n);
+               fprintf(fPtr, " %c  ", atomname);
+               fprintf(fPtr, " ");
+               fprintf(fPtr, " C8");
+               fprintf(fPtr, " ");
+               fprintf(fPtr, " ");
+               fprintf(fPtr, "%4d", m);
+               fprintf(fPtr, " ");
+               fprintf(fPtr, "   ");
+               fprintf(fPtr, "%8.3f%8.3f%8.3f", 
+			moli->p[i].x + imgx, moli->p[i].y+imgy, moli->p[i].z+imgz);
+               fprintf(fPtr, "%6.2f%6.2f", 1.0, 0.0);	// occupance and temperature
+               fprintf(fPtr, "%5.5s", "");
+               fprintf(fPtr, "\n"); 
+            }
+	    */
+         } 
+	 //}
+      }   
+   }
+   fprintf(fPtr, "END\n");
+   fflush(fPtr);
+   return;
+}
+
+//======================================================================//
+//	output_conf(): write configuration to configuration file	//
+//======================================================================//
+
+//======================================================================//
+//	output_Zinput(): write coord. as Z code input file (4/4/13)	//
+//======================================================================//
+
+int displayatom(int n)
+{
+   int	result;
+
+   // for basal slip plane
+   if ( (n<9600 && n/4/40%6==5 && (n%4==2 || n%4==3)) || 
+        (n>=9600 && (n-9600)/4/41%6==0 && (n%4==0 || n%4==1)) ){ 
+
+   // for prismatic slip plane
+//   if ( (n<12000 && n/4/50%15==14 && (n%4==1 || n%4==3)) || 
+//        (n>=12000 && (n-12000)/4/51%15==0 && (n%4==0 || n%4==2)) ){ 
+
+      result	=	1;
+   }
+   else {
+      result	=	0;
+   }
+
+   //--- show all atoms
+   result	=	1;	
+
+   return	result;
+}
+
+
+//==============================================================================//
+//	shift_coord(): shift whole system w.r.t. the com of normal atoms	//
+//			added 3/27/14						//
+//==============================================================================//
+void shift_coord()
+{
+   molstruct	*moli;
+   int		i;
+   int		n;
+   int		system = 0;
+   float	min_cnp=6.8, max_cnp=6.9;
+   vector	com;
+
+   // find the center of mass of all normal atoms
+   V_Null(&com);
+
+   /*
+   n	=	0;
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      for (i=0; i<moli->nsites; i++) {
+	 if (moli->cnp[i] > min_cnp && moli->cnp[i] < max_cnp) {	// normal atoms
+	    com.x	+=	moli->p[i].x;
+	    com.y	+=	moli->p[i].y;
+	    com.z	+=	moli->p[i].z;
+	    n	++;
+	 }
+      }
+   }
+   com	=	V_Mult(1.0/n, &com);
+   */
+   n	=	16000;
+   for (i=0; i<4; i++) {
+      moli	=	mol+n+i;
+      com.x	+=	moli->p[0].x;	
+      com.y	+=	moli->p[0].y;	
+      com.z	+=	moli->p[0].z;	
+   }
+   com	=	V_Mult(1.0/4, &com);
+
+   // shift coordinates
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      for (i=0; i<moli->nsites; i++) {
+	 moli->p[i].x	-=	com.x;
+	 moli->p[i].y	-=	com.y;
+	 moli->p[i].z	-=	com.z;
+      }
+   }
+   printf("shift_coord(): %f %f %f\n", com.x, com.y, com.z);
+   return;
+}
+
+
+void monitor_coord()
+{
+   molstruct	*moli;
+   int		Ncol = 402;
+   int		i, n;
+   int		result;
+   float	ave_cnp = 7.0;
+   float	x[402];
+   float	y[402];
+   float	z[402];
+   float	cnp[402];
+   float	xdis[402];
+   int		nn[402];
+   int		half = 16000;
+   vector	r;
+   int		system = 0;
+
+   // initialization
+   for (i=0; i<Ncol; i++) {
+      x[i]	=	0.0;
+      cnp[i]	=	0.0;
+      xdis[i]	=	0.0;
+      y[i]	=	0.0;
+      z[i]	=	0.0;
+      nn[i]	=	0;
+   }
+
+   //shift_coord();
+
+   for (moli=mol; moli<mol+NMOLS; moli++) {
+      n	=	moli-mol;
+
+      if (moli->type[0]==3) {			// dislocation layer
+
+	 if (n < half && n%4==3) {
+	    i	=	(n/4%100)*2;		// 0, 2, 4, ..., 198
+
+	    x[i]	+=	moli->p[0].x;
+	    y[i]	+=	moli->p[0].y;
+	    z[i]	+=	moli->p[0].z;
+	    cnp[i]	+=	moli->cnp[0];
+	    nn[i]	++;
+	 }
+	 //else if (n < half && n%4==2) {	// basal
+	 else if (n < half && n%4==1) {		// prismatic
+	    i	=	(n/4%100)*2 + 1;	// 1, 3, 5, ..., 199
+
+	    x[i]	+=	moli->p[0].x;
+	    y[i]	+=	moli->p[0].y;
+	    z[i]	+=	moli->p[0].z;
+	    cnp[i]	+=	moli->cnp[0];
+	    nn[i]	++;
+	 }
+	 else if (n >= half && n%4==0) {
+	    i	=	((n-half)/4%101)*2 + 200;	// 200, 202, ..., 400
+
+	    x[i]	+=	moli->p[0].x;
+	    y[i]	+=	moli->p[0].y;
+	    z[i]	+=	moli->p[0].z;
+	    cnp[i]	+=	moli->cnp[0];
+	    nn[i]	++;
+	 }
+	 //else if (n >= half && n%4==1) {	// basal
+	 else if (n >= half && n%4==2) {	// prismatic
+	    i	=	((n-half)/4%101)*2 + 201;	// 201, 203, ..., 401
+
+	    x[i]	+=	moli->p[0].x;
+	    y[i]	+=	moli->p[0].y;
+	    z[i]	+=	moli->p[0].z;
+	    cnp[i]	+=	moli->cnp[0];
+	    nn[i]	++;
+	 }
+      }
+      /*
+      if (displayatom(n) && n<9600 && n%4==2) {
+	 i	=	 n/4%40;
+
+	 x[i]	+=	moli->p[0].x;
+	 cnp[i]	+=	moli->cnp[0];
+	 nn[i]	++;
+      }
+      */
+   }
+    
+   // normalize
+   for (i=0; i<Ncol; i++) {
+      x[i]	/=	nn[i];
+      y[i]	/=	nn[i];
+      z[i]	/=	nn[i];
+      cnp[i]	/=	nn[i];
+   }
+
+
+   printf("x position %ld", timestep);
+   for (i=0; i<Ncol; i++) {
+      printf(" %3d %5.3f %5.3f", i, x[i], cnp[i]);
+   }
+   printf("\n");
+   fflush(stdout);
+
+   for (i=0; i<Ncol; i++) {
+      if (i<2 || (i>=(Ncol-2)/2 && i<(Ncol-2)/2+2)) {
+	 xdis[i]	=	3.2;
+      }
+      else {
+	 xdis[i]	=	x[i] - x[i-2];
+      }
+   }
+   for (i=0; i<(Ncol-2)/2; i+=2){
+      printf("%d %f %f %f %f %f\n", i, x[i], y[i], z[i], cnp[i], xdis[i]);
+   }
+   for (i=1; i<(Ncol-2)/2; i+=2){
+      printf("%d %f %f %f %f %f\n", i, x[i], y[i], z[i], cnp[i], xdis[i]);
+   }
+   for (i=(Ncol-2)/2; i<Ncol; i+=2){
+      printf("%d %f %f %f %f %f\n", i, x[i], y[i], z[i], cnp[i], xdis[i]);
+   }
+   for (i=(Ncol-2)/2+1; i<Ncol; i+=2){
+      printf("%d %f %f %f %f %f\n", i, x[i], y[i], z[i], cnp[i], xdis[i]);
+   }
+   fflush(stdout);
+
+
+   return;
+}
